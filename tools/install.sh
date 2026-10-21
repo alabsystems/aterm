@@ -893,8 +893,11 @@ random_suffix() {
 # arm64 toolchain, `aterm-<v>-x86_64.dmg` the Intel one) was RETIRED
 # 2026-08-26: no release cuts the pair. A release that names no zip in its
 # manifest predates the lean container, so the default falls back to the bare DMG
-# that release was cut for — every older --version pin keeps installing
-# exactly as before.
+# that release was cut for. Only a fork's such release installs: every
+# official one (v0.6.0–v0.11.0) carries an empty team_id, which
+# required_team_for refuses before the download, and with ATERM_TEAM_ID pinning
+# the official team v0.11.0 was downloaded and refused at the signature check
+# (measured 2026-10-20 in a macOS 27 guest).
 #
 # Pure decision logic, extracted from install_app so the whole election matrix
 # is pinned by crates/aterm-update/tests/install_sh without a network. The
@@ -1154,8 +1157,9 @@ gate_pinned_channel() { # <root>
 # it refuses the file. Most shims are that one command (the `alab-<tool>` alias
 # has the same body); on macOS atpkg's `targo` and `targo-tippy` shims first run
 # a block of shell builtins that may put `--config build.build-dir=…` in front
-# of "$@" (crates/atpkg/src/build_cache.rs), so their exec is the last of about
-# seventy lines. Following such a shim is sound: it is read here, never run,
+# of "$@", or export CARGO_BUILD_BUILD_DIR for `targo trust`
+# (crates/atpkg/src/build_cache.rs), so their exec is the last of about a
+# hundred and twenty lines. Following such a shim is sound: it is read here, never run,
 # only to LOCATE the store file, which gate_store_targo must then prove and every
 # build runs by its physical path; a prelude runs only when the shim itself is
 # executed, so it cannot change what is selected. A second `exec` (atpkg's
@@ -2397,8 +2401,10 @@ bin_aterm_plan() { # <path> <store-dir>
 
 # The argv0 aliases the store lanes link beside the store's `aterm`
 # (expose_store_binary), each a symlink whose target is exactly `aterm` — which
-# is how the uninstall sweep knows one, whatever its name.
-STORE_ALIASES="aterm-cli aterm-ctl atpkg abrew atpkg-abrew aterm-fleet aterm-drive aterm-askpass aterm-link aterm-gui"
+# is how the uninstall sweep knows one, whatever its name. A hand copy of
+# aterm_types::argv0::ALIASES (crates/aterm-types/src/argv0.rs): a name added
+# there is added here.
+STORE_ALIASES="aterm-cli aterm-ctl atpkg abrew atpkg-abrew aterm-fleet aterm-drive aterm-askpass aterm-link aterm-gui amacs"
 
 # _dir_split <path> <head-var> <tail-var>: the deepest directory on <path> that
 # exists, resolved (cd -P), and the part below it still to be created, without
